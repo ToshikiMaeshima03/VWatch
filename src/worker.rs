@@ -18,9 +18,16 @@ pub enum Cmd {
     Connect(Box<Config>),
     Disconnect,
     Refresh,
-    Service { unit: String, action: String },
+    Service {
+        unit: String,
+        action: String,
+    },
     ApplyPalworld(Vec<(String, String)>),
-    Kill { pid: i32, label: String, force: bool },
+    Kill {
+        pid: i32,
+        label: String,
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
