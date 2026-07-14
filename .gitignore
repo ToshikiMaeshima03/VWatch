@@ -1,0 +1,8 @@
+/target
+
+# Connection settings live in the OS config dir, never here. Belt and braces in
+# case someone drops one in the working tree.
+config.toml
+*.pem
+*.key
+id_ed25519*

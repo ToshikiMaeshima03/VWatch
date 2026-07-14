@@ -1,0 +1,56 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Built on Windows because Windows is the target: the .exe that ships is the
+  # same binary the tests ran against.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # Every push to main leaves a downloadable exe on the run page.
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: VWatch-windows-x86_64
+          path: target/release/VWatch.exe
+          if-no-files-found: error
+
+      # Tagging `v*` additionally publishes it as a Release asset.
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/VWatch.exe
+          generate_release_notes: true
