@@ -237,8 +237,10 @@ impl App {
             .x_axis_formatter(|mark, _| format!("{:.0}s", mark.value))
             .y_axis_formatter(|mark, _| format!("{:.0}%", mark.value))
             .show(ui, |plot| {
-                plot.line(Line::new("CPU", cpu).color(GREEN).width(1.5));
-                plot.line(Line::new("メモリ", mem).color(AMBER).width(1.5));
+                // `width` takes `impl Into<f32>`; an unsuffixed literal infers as
+                // f64 and leans on a fallback that newer rustc rejects.
+                plot.line(Line::new("CPU", cpu).color(GREEN).width(1.5_f32));
+                plot.line(Line::new("メモリ", mem).color(AMBER).width(1.5_f32));
             });
     }
 

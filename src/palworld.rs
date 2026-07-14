@@ -256,6 +256,34 @@ const RATES: &[Spec] = &[
     },
 ];
 
+/// `BaseCampWorkerMaxNum` is not clamped in the ini either — 30 survives the
+/// shutdown write-back. But the binary has a `GetMaxWorkerMaxNum`, which the
+/// rate settings have no equivalent of, so the game may still refuse to *assign*
+/// more than 20 workers at runtime even though it stores the larger number.
+/// Hence a slider that reaches 30 and a note that says so.
+const BASE: &[Spec] = &[
+    Spec {
+        key: "BaseCampWorkerMaxNum",
+        label: "拠点で働けるパルの数",
+        kind: Kind::Int { min: 1, max: 30 },
+        note: Some(
+            "ゲーム内UIの上限は20。20超も設定は通るが実際に配置できるかは未検証。1体ごとにAIが動くのでCPU負荷に直結する",
+        ),
+    },
+    Spec {
+        key: "BaseCampMaxNumInGuild",
+        label: "ギルドが持てる拠点の数",
+        kind: Kind::Int { min: 1, max: 10 },
+        note: None,
+    },
+    Spec {
+        key: "GuildPlayerMaxNum",
+        label: "ギルドの人数上限",
+        kind: Kind::Int { min: 1, max: 100 },
+        note: None,
+    },
+];
+
 const DROPS: &[Spec] = &[
     Spec {
         key: "DropItemMaxNum",
@@ -357,6 +385,10 @@ pub fn groups() -> Vec<Group> {
         Group {
             title: "レート",
             specs: RATES,
+        },
+        Group {
+            title: "拠点",
+            specs: BASE,
         },
         Group {
             title: "ドロップ",
