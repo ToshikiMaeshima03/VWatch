@@ -267,7 +267,7 @@ impl App {
     fn short_path(&self, path: &str) -> String {
         let home = format!("/home/{}", self.cfg.ssh.user);
         match path.strip_prefix(&home) {
-            Some(rest) if rest.is_empty() => "~".to_owned(),
+            Some("") => "~".to_owned(),
             Some(rest) => format!("~{rest}"),
             None => path.to_owned(),
         }
