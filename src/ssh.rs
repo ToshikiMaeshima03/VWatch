@@ -205,6 +205,95 @@ echo '@@disk';    df -B1 / | tail -1
         Ok(())
     }
 
+    /// The process table, plus `claude` processes resolved to their working
+    /// directory. CPU is sampled as a delta over a short sleep, like the host
+    /// metrics: `ps` %CPU is a lifetime average, so a Claude session that has
+    /// been idle for an hour would still show whatever it burned at startup.
+    ///
+    /// `comm` only — never `args`. An MCP server here is launched with an API
+    /// key in its argv.
+    pub async fn processes(&self) -> Result<(Vec<Proc>, Vec<ClaudeSession>)> {
+        // /proc/<pid>/stat field 2 is the comm in parens and may itself contain
+        // spaces, so everything is indexed from after the last ") ".
+        let ticks = r#"awk '{i=index($0,") ");s=substr($0,i+2);split(s,a," ");split(FILENAME,f,"/");print f[3], a[12]+a[13]}' /proc/[0-9]*/stat 2>/dev/null"#;
+        let script = format!(
+            r#"
+echo '@@hz';   getconf CLK_TCK
+echo '@@e1';   date +%s.%N
+echo '@@t1';   {ticks}
+sleep 0.4
+echo '@@e2';   date +%s.%N
+echo '@@t2';   {ticks}
+echo '@@ps';   ps -eo pid=,ppid=,user:24=,rss=,etimes=,comm=
+echo '@@cwd';  for p in $(pgrep -x claude 2>/dev/null); do printf '%s %s\n' "$p" "$(readlink /proc/$p/cwd 2>/dev/null || echo -)"; done
+"#
+        );
+        let out = self.run(&script).await?;
+        let s = Sections::parse(&out);
+
+        let hz: f64 = s.get("hz").trim().parse().unwrap_or(100.0);
+        let t1 = tick_map(s.get("t1"));
+        let t2 = tick_map(s.get("t2"));
+
+        // The window is *not* the `sleep 0.4` — the awk that reads ~250 /proc
+        // files takes real time too, and assuming 0.4s inflated every reading by
+        // ~8% (a busy-loop that should read 100% came out at 108%). Each awk pass
+        // reads a given pid at the same offset into its run, so the interval
+        // between the two clock stamps is the true per-process sampling window.
+        let stamp = |name: &str| s.get(name).trim().parse::<f64>().ok();
+        let elapsed = stamp("e1")
+            .zip(stamp("e2"))
+            .map(|(a, b)| b - a)
+            // A clock that jumped (NTP step) would otherwise divide by ~0 and
+            // print a five-digit CPU%.
+            .filter(|d| (0.05..=5.0).contains(d))
+            .unwrap_or(0.4);
+        let window = elapsed * hz;
+
+        let mut procs = Vec::new();
+        for line in s.get("ps").lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 6 {
+                continue;
+            }
+            let Ok(pid) = f[0].parse::<i32>() else {
+                continue;
+            };
+            let busy = t2
+                .get(&pid)
+                .zip(t1.get(&pid))
+                .map(|(b, a)| b.saturating_sub(*a))
+                .unwrap_or(0);
+            procs.push(Proc {
+                pid,
+                ppid: f[1].parse().unwrap_or(0),
+                user: f[2].to_owned(),
+                cpu: (busy as f64 / window * 100.0) as f32,
+                rss: f[3].parse::<u64>().unwrap_or(0) * 1024,
+                uptime: f[4].parse().unwrap_or(0),
+                comm: f[5..].join(" "),
+            });
+        }
+
+        let claude = claude_sessions(&procs, s.get("cwd"));
+        procs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
+        Ok((procs, claude))
+    }
+
+    /// TERM (or KILL) a process. Falls back to sudo for processes owned by
+    /// another user — Palworld runs as `steam`, the tunnels as root.
+    pub async fn kill(&self, pid: i32, force: bool) -> Result<()> {
+        if pid <= 1 {
+            bail!("pid {pid} は終了できません");
+        }
+        let sig = if force { "KILL" } else { "TERM" };
+        self.run(&format!(
+            "kill -{sig} {pid} 2>/dev/null || sudo -n kill -{sig} {pid}"
+        ))
+        .await?;
+        Ok(())
+    }
+
     /// Write Palworld settings — the *only* safe order.
     ///
     /// A running Palworld rewrites `PalWorldSettings.ini` from its in-memory
@@ -331,6 +420,62 @@ fn cpu_delta(a: &str, b: &str) -> Option<f32> {
         return None;
     }
     Some(((d_total - d_idle) as f64 / d_total as f64 * 100.0) as f32)
+}
+
+/// `pid busy_ticks` per line, from the awk over /proc/<pid>/stat.
+fn tick_map(text: &str) -> std::collections::HashMap<i32, u64> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let pid = f.next()?.parse().ok()?;
+            let ticks = f.next()?.parse().ok()?;
+            Some((pid, ticks))
+        })
+        .collect()
+}
+
+/// Roll each `claude` process up with everything below it in the process tree.
+fn claude_sessions(procs: &[Proc], cwds: &str) -> Vec<ClaudeSession> {
+    let cwd_of: std::collections::HashMap<i32, &str> = cwds
+        .lines()
+        .filter_map(|line| {
+            let (pid, cwd) = line.trim().split_once(' ')?;
+            Some((pid.parse().ok()?, cwd))
+        })
+        .collect();
+
+    let mut children: std::collections::HashMap<i32, Vec<&Proc>> = std::collections::HashMap::new();
+    for p in procs {
+        children.entry(p.ppid).or_default().push(p);
+    }
+
+    let mut sessions: Vec<ClaudeSession> = procs
+        .iter()
+        .filter(|p| p.comm == "claude")
+        .map(|root| {
+            let (mut cpu, mut rss, mut n) = (root.cpu, root.rss, 0usize);
+            let mut stack = vec![root.pid];
+            while let Some(pid) = stack.pop() {
+                for kid in children.get(&pid).into_iter().flatten() {
+                    cpu += kid.cpu;
+                    rss += kid.rss;
+                    n += 1;
+                    stack.push(kid.pid);
+                }
+            }
+            ClaudeSession {
+                pid: root.pid,
+                cwd: cwd_of.get(&root.pid).unwrap_or(&"-").to_string(),
+                uptime: root.uptime,
+                cpu,
+                rss,
+                descendants: n,
+            }
+        })
+        .collect();
+
+    sessions.sort_by_key(|s| s.pid);
+    sessions
 }
 
 /// RCON `ShowPlayers` prints `name,playeruid,steamid` then one row per player.

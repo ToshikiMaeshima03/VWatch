@@ -1,7 +1,7 @@
 //! The egui front-end. Reads the shared snapshot, sends commands; never blocks.
 
 use crate::config::{Auth, Config};
-use crate::model::{Metrics, human_bytes};
+use crate::model::{Metrics, Snapshot, human_bytes, human_secs};
 use crate::palworld::{self, Kind, PalIni};
 use crate::worker::{self, Cmd, Conn, Handle, Level};
 use egui::{Color32, RichText, Ui};
@@ -12,13 +12,26 @@ const RED: Color32 = Color32::from_rgb(0xe5, 0x53, 0x4b);
 const AMBER: Color32 = Color32::from_rgb(0xd9, 0x9e, 0x22);
 const DIM: Color32 = Color32::from_rgb(0x8b, 0x94, 0x9e);
 
+/// Rows in the process table. Enough to see what's eating the box without
+/// turning the tab into a 250-line dump.
+const TOP_PROCS: usize = 15;
+
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Overview,
+    Processes,
     Services,
     Palworld,
     Settings,
     Log,
+}
+
+/// A pending kill, held while the confirm dialog is up.
+struct KillTarget {
+    pid: i32,
+    label: String,
+    /// What the user loses if this was a misclick.
+    warning: Option<String>,
 }
 
 pub struct App {
@@ -33,6 +46,7 @@ pub struct App {
     pal_edit: Option<PalIni>,
     pal_seen_revision: u64,
     confirm_apply: Option<Vec<(String, String)>>,
+    confirm_kill: Option<KillTarget>,
 }
 
 impl App {
@@ -66,6 +80,7 @@ impl App {
             pal_edit: None,
             pal_seen_revision: 0,
             confirm_apply: None,
+            confirm_kill: None,
         }
     }
 }
@@ -96,6 +111,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Overview => self.overview(ui, &snap.metrics, &history, &conn),
+            Tab::Processes => self.processes(ui, &snap, busy.is_some()),
             Tab::Services => self.services(ui, &snap, busy.is_some()),
             Tab::Palworld => self.palworld(ui, &snap, busy.is_some()),
             Tab::Settings => self.settings(ui),
@@ -103,6 +119,7 @@ impl eframe::App for App {
         });
 
         self.confirm_dialog(ctx, &snap);
+        self.kill_dialog(ctx);
     }
 }
 
@@ -114,6 +131,7 @@ impl App {
                 ui.separator();
                 for (tab, label) in [
                     (Tab::Overview, "概要"),
+                    (Tab::Processes, "プロセス"),
                     (Tab::Services, "サービス"),
                     (Tab::Palworld, "Palworld"),
                     (Tab::Settings, "設定"),
@@ -242,6 +260,249 @@ impl App {
                 plot.line(Line::new("CPU", cpu).color(GREEN).width(1.5_f32));
                 plot.line(Line::new("メモリ", mem).color(AMBER).width(1.5_f32));
             });
+    }
+
+    /// `/home/claude-runner/workflow` reads as `~/workflow` — the prefix is the
+    /// same on every row and just eats width.
+    fn short_path(&self, path: &str) -> String {
+        let home = format!("/home/{}", self.cfg.ssh.user);
+        match path.strip_prefix(&home) {
+            Some(rest) if rest.is_empty() => "~".to_owned(),
+            Some(rest) => format!("~{rest}"),
+            None => path.to_owned(),
+        }
+    }
+
+    fn processes(&mut self, ui: &mut Ui, snap: &Snapshot, busy: bool) {
+        if snap.procs.is_empty() {
+            ui.add_space(20.0);
+            ui.colored_label(DIM, "プロセス情報はまだありません。");
+            return;
+        }
+
+        let mut pending: Option<KillTarget> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Claude Code -----------------------------------------------------
+            ui.horizontal(|ui| {
+                ui.heading("Claude Code");
+                ui.colored_label(DIM, format!("{} セッション", snap.claude.len()));
+                if !snap.claude.is_empty() {
+                    let cpu: f32 = snap.claude.iter().map(|s| s.cpu).sum();
+                    let rss: u64 = snap.claude.iter().map(|s| s.rss).sum();
+                    ui.colored_label(DIM, format!("計 {:.0}%  {}", cpu, human_bytes(rss)));
+                }
+            });
+            ui.add_space(4.0);
+
+            if snap.claude.is_empty() {
+                ui.colored_label(DIM, "動いているセッションはありません。");
+            } else {
+                egui::Grid::new("claude")
+                    .num_columns(7)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for s in &snap.claude {
+                            ui.colored_label(GREEN, "●");
+                            ui.label(RichText::new(self.short_path(&s.cwd)).strong());
+                            ui.label(RichText::new(format!("pid {}", s.pid)).color(DIM));
+                            ui.label(human_secs(s.uptime));
+                            ui.label(
+                                RichText::new(format!("子 {}", s.descendants + 1)).color(DIM),
+                            );
+                            ui.label(format!("{:.0}%", s.cpu));
+                            ui.label(human_bytes(s.rss));
+                            ui.add_enabled_ui(!busy, |ui| {
+                                if ui.small_button("終了").clicked() {
+                                    pending = Some(KillTarget {
+                                        pid: s.pid,
+                                        label: format!("Claude Code ({})", self.short_path(&s.cwd)),
+                                        warning: Some(
+                                            "このセッションで作業中の内容は失われます。子プロセス (MCP サーバー等) も一緒に終了します。"
+                                                .to_owned(),
+                                        ),
+                                    });
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.colored_label(
+                    DIM,
+                    "CPU・メモリはセッション本体と子プロセスの合計です。",
+                );
+            }
+
+            // Palworld --------------------------------------------------------
+            ui.add_space(16.0);
+            ui.heading("Palworld");
+            ui.add_space(4.0);
+            let unit = self.cfg.palworld.service.clone();
+            let running = snap
+                .services
+                .iter()
+                .any(|s| s.name == unit && s.is_active());
+            ui.horizontal(|ui| {
+                if running {
+                    ui.colored_label(GREEN, "● 稼働中");
+                } else {
+                    ui.colored_label(RED, "○ 停止中");
+                }
+                if let Some(p) = snap.proc_by_comm("PalServer-Linux") {
+                    ui.label(format!("{:.0}%", p.cpu));
+                    ui.label(human_bytes(p.rss));
+                    ui.colored_label(DIM, human_secs(p.uptime));
+                }
+                if let Some(players) = &snap.players {
+                    ui.colored_label(DIM, format!("{} 人がプレイ中", players.len()));
+                }
+                ui.add_enabled_ui(!busy, |ui| {
+                    for action in ["start", "stop", "restart"] {
+                        if ui.small_button(action).clicked() {
+                            self.handle.send(Cmd::Service {
+                                unit: unit.clone(),
+                                action: action.to_owned(),
+                            });
+                        }
+                    }
+                });
+            });
+
+            // PM2 -------------------------------------------------------------
+            if !snap.pm2.is_empty() {
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.heading("PM2");
+                    let online = snap.pm2.iter().filter(|a| a.is_online()).count();
+                    let rss: u64 = snap.pm2.iter().map(|a| a.memory).sum();
+                    ui.colored_label(
+                        DIM,
+                        format!(
+                            "{online}/{} 稼働  計 {}",
+                            snap.pm2.len(),
+                            human_bytes(rss)
+                        ),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    for app in &snap.pm2 {
+                        let color = if app.is_online() { GREEN } else { RED };
+                        ui.colored_label(color, "●");
+                        ui.label(&app.name);
+                        ui.colored_label(DIM, human_bytes(app.memory));
+                        ui.add_space(8.0);
+                    }
+                });
+            }
+
+            // Top processes ---------------------------------------------------
+            ui.add_space(16.0);
+            let listed: Vec<&crate::model::Proc> = snap
+                .procs
+                .iter()
+                .filter(|p| !p.is_kernel_thread())
+                .take(TOP_PROCS)
+                .collect();
+            ui.horizontal(|ui| {
+                ui.heading("上位プロセス");
+                ui.colored_label(DIM, format!("全 {} プロセス中", snap.procs.len()));
+            });
+            ui.add_space(4.0);
+            egui::Grid::new("top_procs")
+                .num_columns(7)
+                .spacing([16.0, 6.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for h in ["PID", "ユーザー", "CPU", "メモリ", "稼働", "コマンド", ""] {
+                        ui.label(RichText::new(h).color(DIM));
+                    }
+                    ui.end_row();
+
+                    for p in listed {
+                        ui.label(p.pid.to_string());
+                        ui.label(RichText::new(&p.user).color(DIM));
+                        ui.label(format!("{:.0}%", p.cpu));
+                        ui.label(human_bytes(p.rss));
+                        ui.label(RichText::new(human_secs(p.uptime)).color(DIM));
+                        ui.label(&p.comm);
+                        ui.add_enabled_ui(!busy && p.pid > 1, |ui| {
+                            if ui.small_button("終了").clicked() {
+                                pending = Some(KillTarget {
+                                    pid: p.pid,
+                                    label: p.comm.clone(),
+                                    warning: kill_warning(&p.comm),
+                                });
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(4.0);
+            ui.colored_label(
+                DIM,
+                "コマンド名のみを表示します（引数には API キーが載ることがあるため）。",
+            );
+            ui.add_space(16.0);
+        });
+
+        if pending.is_some() {
+            self.confirm_kill = pending;
+        }
+    }
+
+    fn kill_dialog(&mut self, ctx: &egui::Context) {
+        let Some(target) = &self.confirm_kill else {
+            return;
+        };
+
+        let mut open = true;
+        let mut send: Option<bool> = None;
+        egui::Window::new("プロセスを終了しますか？")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&target.label).strong());
+                ui.colored_label(DIM, format!("pid {}", target.pid));
+                if let Some(warning) = &target.warning {
+                    ui.add_space(8.0);
+                    ui.colored_label(RED, format!("⚠ {warning}"));
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("終了 (SIGTERM)").strong()).clicked() {
+                        send = Some(false);
+                    }
+                    if ui
+                        .button(RichText::new("強制終了 (SIGKILL)").color(RED))
+                        .clicked()
+                    {
+                        send = Some(true);
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        open = false;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.colored_label(
+                    DIM,
+                    "SIGTERM は後片付けの余地を与えます。SIGKILL は即死で、保存されていないものは失われます。",
+                );
+            });
+
+        if let Some(force) = send {
+            let target = self.confirm_kill.take().expect("checked above");
+            self.handle.send(Cmd::Kill {
+                pid: target.pid,
+                label: target.label,
+                force,
+            });
+        } else if !open {
+            self.confirm_kill = None;
+        }
     }
 
     fn services(&mut self, ui: &mut Ui, snap: &crate::model::Snapshot, busy: bool) {
@@ -689,6 +950,24 @@ impl App {
                     });
                 }
             });
+    }
+}
+
+/// The processes where a stray click costs something you can't get back.
+fn kill_warning(comm: &str) -> Option<String> {
+    match comm {
+        "claude" => Some(
+            "Claude Code のセッションです。作業中の内容は失われます。".to_owned(),
+        ),
+        "PalServer-Linux" => Some(
+            "Palworld サーバー本体です。プレイ中の人は全員切断されます（systemd 経由の restart のほうが安全です）。"
+                .to_owned(),
+        ),
+        "sshd-session" | "sshd" => Some(
+            "SSH のセッションです。VWatch 自身の接続を切ってしまう可能性があります。".to_owned(),
+        ),
+        "systemd" => Some("systemd です。終了させるべきではありません。".to_owned()),
+        _ => None,
     }
 }
 

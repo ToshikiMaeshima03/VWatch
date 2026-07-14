@@ -20,6 +20,7 @@ pub enum Cmd {
     Refresh,
     Service { unit: String, action: String },
     ApplyPalworld(Vec<(String, String)>),
+    Kill { pid: i32, label: String, force: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -175,6 +176,14 @@ impl Worker {
         }
 
         if failure.is_none() {
+            match vps.processes().await {
+                Ok((procs, claude)) => {
+                    snap.procs = procs;
+                    snap.claude = claude;
+                }
+                // A process table we couldn't read shouldn't blank the whole view.
+                Err(e) => self.log(Level::Warn, format!("プロセス一覧の取得に失敗: {e:#}")),
+            }
             snap.services = vps.services(&cfg.services).await.unwrap_or_default();
             if cfg.show_pm2 {
                 snap.pm2 = vps.pm2().await.unwrap_or_default();
@@ -235,6 +244,29 @@ impl Worker {
         match result {
             Ok(()) => self.log(Level::Ok, format!("{unit}: {action} を実行しました")),
             Err(e) => self.log(Level::Error, format!("{unit}: {action} に失敗 — {e:#}")),
+        }
+        self.poll().await;
+    }
+
+    async fn kill(&mut self, pid: i32, label: String, force: bool) {
+        let Some(vps) = &self.vps else {
+            return;
+        };
+        let sig = if force { "強制終了" } else { "終了" };
+
+        self.set(|s| s.busy = Some(format!("{label} (pid {pid}) を{sig}しています…")));
+        let result = vps.kill(pid, force).await;
+        self.set(|s| s.busy = None);
+
+        match result {
+            Ok(()) => self.log(
+                Level::Warn,
+                format!("{label} (pid {pid}) に{sig}シグナルを送りました"),
+            ),
+            Err(e) => self.log(
+                Level::Error,
+                format!("{label} (pid {pid}) の{sig}に失敗 — {e:#}"),
+            ),
         }
         self.poll().await;
     }
@@ -305,6 +337,7 @@ async fn run(mut rx: UnboundedReceiver<Cmd>, shared: Arc<Mutex<Shared>>, ctx: eg
                     Cmd::Refresh => w.poll().await,
                     Cmd::Service { unit, action } => w.service_action(unit, action).await,
                     Cmd::ApplyPalworld(changes) => w.apply_palworld(changes).await,
+                    Cmd::Kill { pid, label, force } => w.kill(pid, label, force).await,
                 }
             }
             _ = tick.tick() => {
