@@ -45,8 +45,20 @@ pub struct App {
     /// changes underneath us.
     pal_edit: Option<PalIni>,
     pal_seen_revision: u64,
+    /// Substring match over label and key — there are ~110 settings.
+    pal_filter: String,
+    /// Which secrets the user has chosen to un-mask, per key.
+    pal_reveal: std::collections::HashMap<&'static str, bool>,
     confirm_apply: Option<Vec<(String, String)>>,
     confirm_kill: Option<KillTarget>,
+}
+
+/// Match on the Japanese label or the raw ini key, so both "夜" and "Night" find
+/// `NightTimeSpeedRate`.
+fn matches_filter(spec: &palworld::Spec, filter: &str) -> bool {
+    filter.is_empty()
+        || spec.label.to_lowercase().contains(filter)
+        || spec.key.to_lowercase().contains(filter)
 }
 
 impl App {
@@ -79,6 +91,8 @@ impl App {
             config_notice,
             pal_edit: None,
             pal_seen_revision: 0,
+            pal_filter: String::new(),
+            pal_reveal: std::collections::HashMap::new(),
             confirm_apply: None,
             confirm_kill: None,
         }
@@ -630,6 +644,18 @@ impl App {
         }
 
         ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("絞り込み");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pal_filter)
+                    .hint_text("項目名 / キー名（例: 夜, Night, ドロップ）")
+                    .desired_width(280.0),
+            );
+            if !self.pal_filter.is_empty() && ui.small_button("×").clicked() {
+                self.pal_filter.clear();
+            }
+        });
+        ui.add_space(6.0);
         ui.separator();
 
         let Some(original) = snap.palworld_ini.as_ref() else {
@@ -640,6 +666,10 @@ impl App {
             );
             return;
         };
+        // Disjoint field borrows: the list needs the editable ini, the secret
+        // widgets need the reveal flags, and both are alive across the closure.
+        let filter = self.pal_filter.to_lowercase();
+        let reveal = &mut self.pal_reveal;
         let Some(edit) = self.pal_edit.as_mut() else {
             return;
         };
@@ -673,7 +703,19 @@ impl App {
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                let mut shown = 0usize;
                 for group in palworld::groups() {
+                    // A key Palworld didn't write out isn't editable here.
+                    let visible: Vec<&palworld::Spec> = group
+                        .specs
+                        .iter()
+                        .filter(|s| edit.get(s.key).is_some() && matches_filter(s, &filter))
+                        .collect();
+                    if visible.is_empty() {
+                        continue;
+                    }
+                    shown += visible.len();
+
                     ui.add_space(10.0);
                     ui.label(RichText::new(group.title).strong().size(15.0));
                     ui.add_space(4.0);
@@ -682,11 +724,7 @@ impl App {
                         .num_columns(2)
                         .spacing([20.0, 8.0])
                         .show(ui, |ui| {
-                            for spec in group.specs {
-                                // A key Palworld didn't write out isn't editable here.
-                                if edit.get(spec.key).is_none() {
-                                    continue;
-                                }
+                            for spec in visible {
                                 let dirty = changes.iter().any(|(k, _)| k == spec.key);
 
                                 ui.horizontal(|ui| {
@@ -694,14 +732,15 @@ impl App {
                                     if dirty {
                                         label = label.color(AMBER).strong();
                                     }
-                                    ui.label(label);
+                                    ui.label(label).on_hover_text(spec.key);
                                     if dirty {
                                         ui.colored_label(AMBER, "●");
                                     }
                                 });
 
                                 ui.vertical(|ui| {
-                                    widget(ui, edit, spec, busy);
+                                    let seen = reveal.entry(spec.key).or_insert(false);
+                                    widget(ui, edit, spec, busy, seen);
                                     if let Some(note) = spec.note {
                                         ui.label(RichText::new(note).size(11.0).color(DIM));
                                     }
@@ -709,6 +748,10 @@ impl App {
                                 ui.end_row();
                             }
                         });
+                }
+                if shown == 0 {
+                    ui.add_space(20.0);
+                    ui.colored_label(DIM, "該当する設定はありません。");
                 }
                 ui.add_space(16.0);
             });
@@ -971,7 +1014,7 @@ fn kill_warning(comm: &str) -> Option<String> {
     }
 }
 
-fn widget(ui: &mut Ui, ini: &mut PalIni, spec: &palworld::Spec, busy: bool) {
+fn widget(ui: &mut Ui, ini: &mut PalIni, spec: &palworld::Spec, busy: bool, reveal: &mut bool) {
     ui.add_enabled_ui(!busy, |ui| match spec.kind {
         Kind::Float { min, max } => {
             let mut v = ini.get_f32(spec.key).unwrap_or(min);
@@ -1013,6 +1056,37 @@ fn widget(ui: &mut Ui, ini: &mut PalIni, spec: &palworld::Spec, busy: bool) {
             if ui.text_edit_singleline(&mut v).changed() {
                 // Palworld stores these quoted; keep it that way.
                 ini.set(spec.key, format!("\"{}\"", v.replace('"', "")));
+            }
+        }
+        Kind::Secret => {
+            let mut v = ini.get_str(spec.key).unwrap_or("").to_owned();
+            ui.horizontal(|ui| {
+                let hidden = !*reveal;
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut v)
+                            .password(hidden)
+                            .desired_width(220.0),
+                    )
+                    .changed()
+                {
+                    ini.set(spec.key, format!("\"{}\"", v.replace('"', "")));
+                }
+                let (icon, tip) = if hidden {
+                    ("表示", "画面に平文で出ます。スクリーンショットに注意")
+                } else {
+                    ("隠す", "伏せ字に戻す")
+                };
+                if ui.small_button(icon).on_hover_text(tip).clicked() {
+                    *reveal = !*reveal;
+                }
+            });
+        }
+        Kind::Raw => {
+            let mut v = ini.get(spec.key).unwrap_or("").to_owned();
+            if ui.text_edit_singleline(&mut v).changed() {
+                // No quoting, no coercion — `(Steam,Xbox)` has to survive verbatim.
+                ini.set(spec.key, v);
             }
         }
     });
