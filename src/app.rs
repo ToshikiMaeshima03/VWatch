@@ -385,68 +385,80 @@ impl App {
 
         let changes = worker::diff(original, edit);
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for group in palworld::groups() {
-                ui.add_space(10.0);
-                ui.label(RichText::new(group.title).strong().size(15.0));
-                ui.add_space(4.0);
-
-                egui::Grid::new(group.title)
-                    .num_columns(2)
-                    .spacing([20.0, 8.0])
-                    .show(ui, |ui| {
-                        for spec in group.specs {
-                            // A key Palworld didn't write out isn't editable here.
-                            if edit.get(spec.key).is_none() {
-                                continue;
-                            }
-                            let dirty = changes.iter().any(|(k, _)| k == spec.key);
-
-                            ui.horizontal(|ui| {
-                                let mut label = RichText::new(spec.label);
-                                if dirty {
-                                    label = label.color(AMBER).strong();
-                                }
-                                ui.label(label);
-                                if dirty {
-                                    ui.colored_label(AMBER, "●");
-                                }
-                            });
-
-                            ui.vertical(|ui| {
-                                widget(ui, edit, spec, busy);
-                                if let Some(note) = spec.note {
-                                    ui.label(RichText::new(note).size(11.0).color(DIM));
-                                }
-                            });
-                            ui.end_row();
-                        }
-                    });
-            }
-            ui.add_space(16.0);
-        });
-
         // Apply bar -------------------------------------------------------
-        ui.separator();
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!busy && !changes.is_empty(), |ui| {
-                if ui
-                    .button(RichText::new("適用してサーバーを再起動").strong())
-                    .clicked()
-                {
-                    self.confirm_apply = Some(changes.clone());
+        // Reserved *before* the settings list: the list scrolls, and anything
+        // laid out after a full-height ScrollArea lands below the panel's
+        // visible rect, where it can never be scrolled into view.
+        let mut apply = false;
+        let mut discard = false;
+
+        egui::TopBottomPanel::bottom("palworld_apply").show_inside(ui, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!busy && !changes.is_empty(), |ui| {
+                    apply |= ui
+                        .button(RichText::new("適用してサーバーを再起動").strong())
+                        .clicked();
+                });
+                if !changes.is_empty() {
+                    discard |= ui.button("変更を破棄").clicked();
+                    ui.colored_label(AMBER, format!("{} 件の変更", changes.len()));
+                } else {
+                    ui.colored_label(DIM, "変更はありません");
                 }
             });
-            if !changes.is_empty() {
-                if ui.button("変更を破棄").clicked() {
-                    self.pal_edit = snap.palworld_ini.clone();
-                }
-                ui.colored_label(AMBER, format!("{} 件の変更", changes.len()));
-            } else {
-                ui.colored_label(DIM, "変更はありません");
-            }
+            ui.add_space(6.0);
         });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for group in palworld::groups() {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(group.title).strong().size(15.0));
+                    ui.add_space(4.0);
+
+                    egui::Grid::new(group.title)
+                        .num_columns(2)
+                        .spacing([20.0, 8.0])
+                        .show(ui, |ui| {
+                            for spec in group.specs {
+                                // A key Palworld didn't write out isn't editable here.
+                                if edit.get(spec.key).is_none() {
+                                    continue;
+                                }
+                                let dirty = changes.iter().any(|(k, _)| k == spec.key);
+
+                                ui.horizontal(|ui| {
+                                    let mut label = RichText::new(spec.label);
+                                    if dirty {
+                                        label = label.color(AMBER).strong();
+                                    }
+                                    ui.label(label);
+                                    if dirty {
+                                        ui.colored_label(AMBER, "●");
+                                    }
+                                });
+
+                                ui.vertical(|ui| {
+                                    widget(ui, edit, spec, busy);
+                                    if let Some(note) = spec.note {
+                                        ui.label(RichText::new(note).size(11.0).color(DIM));
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                }
+                ui.add_space(16.0);
+            });
+        });
+
+        // `edit` borrows self.pal_edit for as long as the list is being drawn.
+        if apply {
+            self.confirm_apply = Some(changes);
+        } else if discard {
+            self.pal_edit = snap.palworld_ini.clone();
+        }
     }
 
     fn confirm_dialog(&mut self, ctx: &egui::Context, snap: &crate::model::Snapshot) {
