@@ -357,10 +357,38 @@ echo '@@cwd';  for p in $(pgrep -x claude 2>/dev/null); do printf '%s %s\n' "$p"
         .await
         .context("設定ファイルの書き込みに失敗しました（バックアップ: .vwatch.bak）")?;
 
+        // Read the file back rather than trusting the copy we just rendered.
+        // Reporting "適用しました" for a write that didn't land is the one failure
+        // this whole dance exists to prevent, and `tee` exiting 0 doesn't prove it.
+        progress("書き込みを確認しています…");
+        let written = self.run(&format!("{sudo}cat {path}")).await?;
+        let on_disk = PalIni::parse(&written)?;
+        let mismatched: Vec<String> = changes
+            .iter()
+            .filter(|(key, value)| on_disk.get(key) != Some(value.as_str()))
+            .map(|(key, value)| {
+                format!(
+                    "{key}: {value} のはずが {}",
+                    on_disk.get(key).unwrap_or("(不明)")
+                )
+            })
+            .collect();
+
+        // Start regardless: a server left down is worse than one running on a
+        // file we're about to complain about, and the old file is still in .bak.
         progress("Palworld を起動しています…");
         self.run(&format!("{sudo}systemctl start {unit}")).await?;
 
-        Ok(ini)
+        if !mismatched.is_empty() {
+            bail!(
+                "書き込み後の内容が一致しません（{} は起動しました。元の設定は {}.vwatch.bak にあります）:\n{}",
+                pal.service,
+                pal.ini_path,
+                mismatched.join("\n")
+            );
+        }
+
+        Ok(on_disk)
     }
 }
 

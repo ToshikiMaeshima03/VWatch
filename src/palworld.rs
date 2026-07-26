@@ -156,8 +156,13 @@ fn split_top_level(s: &str) -> Vec<String> {
 }
 
 /// Palworld writes floats as `5.000000`; match that so our diffs stay clean.
+///
+/// `{:.6}` alone prints the f32's *exact* binary value, so a typed `12345.678`
+/// lands in the ini as `12345.677734`. Go through the shortest decimal that
+/// still round-trips to the same f32 first, and the file shows what was typed.
 pub fn fmt_f32(v: f32) -> String {
-    format!("{v:.6}")
+    let exact: f64 = v.to_string().parse().unwrap_or(v as f64);
+    format!("{exact:.6}")
 }
 
 // ---------------------------------------------------------------------------
@@ -462,30 +467,46 @@ const CONDITION: &[Spec] = &[
     },
 ];
 
+/// The four damage rates ran 0.1〜5.0, which is where the live server's values
+/// had all piled up: the slider used to clamp, so pushing past the edge wrote
+/// nothing at all and the apply button just said "変更はありません". The box is
+/// unclamped now, and the handle reaches as far as the other multipliers do.
 const COMBAT: &[Spec] = &[
     Spec {
         key: "PalDamageRateAttack",
         label: "パルの与ダメージ",
-        kind: Kind::Float { min: 0.1, max: 5.0 },
+        kind: Kind::Float {
+            min: 0.1,
+            max: 20.0,
+        },
         note: None,
     },
     Spec {
         key: "PalDamageRateDefense",
         label: "パルの被ダメージ",
-        kind: Kind::Float { min: 0.1, max: 5.0 },
-        note: None,
+        kind: Kind::Float {
+            min: 0.0,
+            max: 20.0,
+        },
+        note: Some("0 でパルが無敵になる"),
     },
     Spec {
         key: "PlayerDamageRateAttack",
         label: "プレイヤーの与ダメージ",
-        kind: Kind::Float { min: 0.1, max: 5.0 },
+        kind: Kind::Float {
+            min: 0.1,
+            max: 20.0,
+        },
         note: None,
     },
     Spec {
         key: "PlayerDamageRateDefense",
         label: "プレイヤーの被ダメージ",
-        kind: Kind::Float { min: 0.1, max: 5.0 },
-        note: None,
+        kind: Kind::Float {
+            min: 0.0,
+            max: 20.0,
+        },
+        note: Some("0 でプレイヤーが無敵になる"),
     },
     Spec {
         key: "bEnableInvaderEnemy",
@@ -524,9 +545,27 @@ const COMBAT: &[Spec] = &[
         note: None,
     },
     Spec {
+        key: "AdditionalDropItemWhenPlayerKillingInPvPMode",
+        label: "PvPキル時の追加ドロップ品",
+        kind: Kind::Text,
+        note: Some("ドロップテーブル名。既定は PlayerDropItem"),
+    },
+    Spec {
         key: "AdditionalDropItemNumWhenPlayerKillingInPvPMode",
         label: "PvPキル時の追加ドロップ数",
         kind: Kind::Int { min: 0, max: 10 },
+        note: None,
+    },
+    Spec {
+        key: "bDisplayPvPItemNumOnWorldMap_BaseCamp",
+        label: "PvPドロップ数をマップに表示(拠点)",
+        kind: Kind::Bool,
+        note: None,
+    },
+    Spec {
+        key: "bDisplayPvPItemNumOnWorldMap_Player",
+        label: "PvPドロップ数をマップに表示(プレイヤー)",
+        kind: Kind::Bool,
         note: None,
     },
     Spec {
@@ -675,6 +714,36 @@ const DROPS: &[Spec] = &[
         label: "他ギルドの死亡ドロップを拾える",
         kind: Kind::Bool,
         note: None,
+    },
+    // The respawn trio arrived with a server update and is undocumented; the
+    // ranges below are room to move around the shipped defaults (5 / 0 / 2),
+    // not limits the server enforces.
+    Spec {
+        key: "BlockRespawnTime",
+        label: "リスポーンできるまでの時間(秒)",
+        kind: Kind::Float {
+            min: 0.0,
+            max: 60.0,
+        },
+        note: Some("既定は 5"),
+    },
+    Spec {
+        key: "RespawnPenaltyDurationThreshold",
+        label: "リスポーンペナルティの判定時間(秒)",
+        kind: Kind::Float {
+            min: 0.0,
+            max: 600.0,
+        },
+        note: Some("この時間内に死に直すとリスポーンが延びる。既定の 0 はペナルティなし"),
+    },
+    Spec {
+        key: "RespawnPenaltyTimeScale",
+        label: "リスポーンペナルティの倍率",
+        kind: Kind::Float {
+            min: 1.0,
+            max: 10.0,
+        },
+        note: Some("上の判定に掛かったときリスポーン時間に掛ける倍率。既定は 2"),
     },
 ];
 
@@ -928,6 +997,12 @@ const SERVER: &[Spec] = &[
         kind: Kind::Int { min: 1, max: 365 },
         note: None,
     },
+    Spec {
+        key: "MaxGuildsPerFrame",
+        label: "1フレームで処理するギルド数",
+        kind: Kind::Int { min: 1, max: 100 },
+        note: Some("下げるとCPU負荷が減るが、ギルド関連の処理が追いつかなくなる。既定は 10"),
+    },
 ];
 
 const VOICE: &[Spec] = &[
@@ -1040,7 +1115,7 @@ pub fn groups() -> Vec<Group> {
             specs: BASE,
         },
         Group {
-            title: "ドロップ",
+            title: "ドロップ・死亡",
             specs: DROPS,
         },
         Group {
@@ -1138,14 +1213,37 @@ mod tests {
     }
 
     #[test]
+    fn fmt_f32_writes_the_typed_decimal_not_the_binary_expansion() {
+        assert_eq!(fmt_f32(2.5), "2.500000");
+        assert_eq!(fmt_f32(0.05), "0.050000");
+        // `format!("{:.6}", 12345.678_f32)` gives `12345.677734`.
+        assert_eq!(fmt_f32(12345.678), "12345.678000");
+    }
+
+    /// The box beside the slider is unclamped, so a value can legitimately sit
+    /// outside a spec's range — and has to survive the round-trip.
+    #[test]
+    fn a_value_beyond_the_slider_range_round_trips() {
+        let mut ini = PalIni::parse(SAMPLE).unwrap();
+        ini.set("PlayerDamageRateAttack", fmt_f32(50.0));
+        let reparsed = PalIni::parse(&ini.render()).unwrap();
+        assert_eq!(reparsed.get_f32("PlayerDamageRateAttack"), Some(50.0));
+    }
+
+    #[test]
     fn missing_option_line_is_an_error_not_a_panic() {
         assert!(PalIni::parse("[/Script/Pal.PalGameWorldSettings]\n").is_err());
     }
 
-    /// Every key the live server (v1.0.0.100427) writes into `OptionSettings`,
-    /// in file order. The UI is meant to cover all of them; a key here with no
-    /// spec is a setting the user can't reach, and a spec whose key isn't here
-    /// is a typo that would silently never render.
+    /// Every key the live server (Steam buildid 24181105) writes into
+    /// `OptionSettings`, in file order. The UI is meant to cover all of them; a
+    /// key here with no spec is a setting the user can't reach, and a spec whose
+    /// key isn't here is a typo that would silently never render.
+    ///
+    /// A server update adds keys to this line, so this list goes stale quietly —
+    /// it grew by seven (the respawn-penalty trio, the PvP map display pair,
+    /// `MaxGuildsPerFrame` and the PvP drop-table name) between two builds.
+    /// Re-derive it from the real file rather than trusting it.
     const LIVE_KEYS: &[&str] = &[
         "Difficulty",
         "RandomizerType",
@@ -1247,6 +1345,13 @@ mod tests {
         "GuildRejoinCooldownMinutes",
         "AutoTransferMasterCheckIntervalSeconds",
         "AutoTransferMasterThresholdDays",
+        "MaxGuildsPerFrame",
+        "BlockRespawnTime",
+        "RespawnPenaltyDurationThreshold",
+        "RespawnPenaltyTimeScale",
+        "bDisplayPvPItemNumOnWorldMap_BaseCamp",
+        "bDisplayPvPItemNumOnWorldMap_Player",
+        "AdditionalDropItemWhenPlayerKillingInPvPMode",
         "AdditionalDropItemNumWhenPlayerKillingInPvPMode",
         "bAdditionalDropItemWhenPlayerKillingInPvPMode",
         "bEnableVoiceChat",

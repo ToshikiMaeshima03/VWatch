@@ -655,6 +655,14 @@ impl App {
                 self.pal_filter.clear();
             }
         });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "スライダーの範囲は目安です。右の数値ボックスには、範囲外の値も丸めずに入力できます。",
+            )
+            .size(11.0)
+            .color(DIM),
+        );
         ui.add_space(6.0);
         ui.separator();
 
@@ -1014,22 +1022,50 @@ fn kill_warning(comm: &str) -> Option<String> {
     }
 }
 
+/// egui clamps a slider's value to its range by default — including the value
+/// typed into the box beside it, and including a value that was already outside
+/// the range when the widget was first drawn. Neither is right here: Palworld
+/// does not clamp what it reads from the ini, so the range is only how far the
+/// *handle* travels, and the box has to stay exact.
+const UNCLAMPED: egui::SliderClamping = egui::SliderClamping::Never;
+
+/// Say so when the value sits outside the slider's range, since the widget no
+/// longer snaps it back into view.
+fn out_of_range(ui: &mut Ui, outside: bool, min: &str, max: &str) {
+    if outside {
+        ui.label(
+            RichText::new(format!("目安の範囲 ({min}〜{max}) の外です"))
+                .size(11.0)
+                .color(AMBER),
+        );
+    }
+}
+
 fn widget(ui: &mut Ui, ini: &mut PalIni, spec: &palworld::Spec, busy: bool, reveal: &mut bool) {
     ui.add_enabled_ui(!busy, |ui| match spec.kind {
         Kind::Float { min, max } => {
             let mut v = ini.get_f32(spec.key).unwrap_or(min);
-            if ui
-                .add(egui::Slider::new(&mut v, min..=max).fixed_decimals(2))
-                .changed()
-            {
+            // No `fixed_decimals`: it rounds what you type to two places. The
+            // handle still lands on round numbers on its own (egui's smart aim).
+            let changed = ui
+                .add(egui::Slider::new(&mut v, min..=max).clamping(UNCLAMPED))
+                .changed();
+            // An unclamped box will happily parse `inf`, which would go into the
+            // ini as a value Palworld can't read back.
+            if changed && v.is_finite() {
                 ini.set(spec.key, palworld::fmt_f32(v));
             }
+            out_of_range(ui, v < min || v > max, &format!("{min}"), &format!("{max}"));
         }
         Kind::Int { min, max } => {
             let mut v = ini.get_i64(spec.key).unwrap_or(min);
-            if ui.add(egui::Slider::new(&mut v, min..=max)).changed() {
+            if ui
+                .add(egui::Slider::new(&mut v, min..=max).clamping(UNCLAMPED))
+                .changed()
+            {
                 ini.set(spec.key, v.to_string());
             }
+            out_of_range(ui, v < min || v > max, &format!("{min}"), &format!("{max}"));
         }
         Kind::Bool => {
             let mut v = ini.get_bool(spec.key).unwrap_or(false);
